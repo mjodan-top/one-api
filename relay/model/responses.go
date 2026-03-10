@@ -1,15 +1,44 @@
 package model
 
+import "encoding/json"
+
 // ResponsesRequest represents the OpenAI Responses API request format
 type ResponsesRequest struct {
 	Model        string              `json:"model"`
-	Input        []ResponsesInputItem `json:"input"`
+	Input        ResponsesInput      `json:"input"`
 	Instructions *string             `json:"instructions,omitempty"`
 	Tools        []Tool              `json:"tools,omitempty"`
 	Stream       bool                `json:"stream,omitempty"`
 	Temperature  *float64            `json:"temperature,omitempty"`
 	TopP         *float64            `json:"top_p,omitempty"`
 	MaxTokens    *int                `json:"max_output_tokens,omitempty"`
+}
+
+// ResponsesInput can be a string or an array of ResponsesInputItem
+type ResponsesInput []ResponsesInputItem
+
+func (r *ResponsesInput) UnmarshalJSON(data []byte) error {
+	// Try as string first
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*r = []ResponsesInputItem{
+			{
+				Type: "message",
+				Role: "user",
+				Content: []ContentItem{
+					{Type: "input_text", Text: s},
+				},
+			},
+		}
+		return nil
+	}
+	// Try as array
+	var items []ResponsesInputItem
+	if err := json.Unmarshal(data, &items); err != nil {
+		return err
+	}
+	*r = items
+	return nil
 }
 
 // ResponsesInputItem represents an item in the input array

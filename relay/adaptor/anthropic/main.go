@@ -89,8 +89,13 @@ func ConvertRequest(textRequest model.GeneralOpenAIRequest) *Request {
 		claudeRequest.Model = "claude-2.1"
 	}
 	for _, message := range textRequest.Messages {
-		if message.Role == "system" && claudeRequest.System == "" {
+		if (message.Role == "system" || message.Role == "developer") && claudeRequest.System == "" {
 			claudeRequest.System = message.StringContent()
+			continue
+		}
+		if message.Role == "developer" {
+			// Append additional developer messages to system
+			claudeRequest.System += "\n" + message.StringContent()
 			continue
 		}
 		claudeMessage := Message{
@@ -209,8 +214,10 @@ func StreamResponseClaude2OpenAI(claudeResponse *StreamResponse) (*openai.ChatCo
 
 func ResponseClaude2OpenAI(claudeResponse *Response) *openai.TextResponse {
 	var responseText string
-	if len(claudeResponse.Content) > 0 {
-		responseText = claudeResponse.Content[0].Text
+	for _, v := range claudeResponse.Content {
+		if v.Type == "text" {
+			responseText += v.Text
+		}
 	}
 	tools := make([]model.Tool, 0)
 	for _, v := range claudeResponse.Content {

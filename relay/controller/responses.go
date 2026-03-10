@@ -135,175 +135,82 @@ func getResponsesRequestBody(c *gin.Context, metaObj *meta.Meta, chatReq *model.
 	return bytes.NewBuffer(jsonData), nil
 }
 
+// captureWriter intercepts what adaptor.DoResponse writes to gin.Context
+type captureWriter struct {
+	gin.ResponseWriter
+	body       *bytes.Buffer
+	statusCode int
+}
+
+func newCaptureWriter(w gin.ResponseWriter) *captureWriter {
+	return &captureWriter{
+		ResponseWriter: w,
+		body:           &bytes.Buffer{},
+	}
+}
+
+func (cw *captureWriter) Write(data []byte) (int, error) {
+	return cw.body.Write(data)
+}
+
+func (cw *captureWriter) WriteString(s string) (int, error) {
+	return cw.body.WriteString(s)
+}
+
+func (cw *captureWriter) WriteHeader(code int) {
+	cw.statusCode = code
+}
+
 func doResponsesResponse(c *gin.Context, resp *http.Response, metaObj *meta.Meta, adaptorObj adaptor.Adaptor, isStream bool) (*model.Usage, *model.ErrorWithStatusCode) {
+	if metaObj.APIType == apitype.OpenAI {
+		// OpenAI format: parse directly
+		if isStream {
+			return responsesStreamHandler(c, resp)
+		}
+		return responsesNonStreamHandler(c, resp)
+	}
+
+	// Non-OpenAI (Anthropic, etc.): use adaptor to convert response to OpenAI format first
+	// Capture adaptor's output via a buffer writer
+	realWriter := c.Writer
+	cw := newCaptureWriter(realWriter)
+	c.Writer = cw
+
+	usage, respErr := adaptorObj.DoResponse(c, resp, metaObj)
+
+	// Restore real writer
+	c.Writer = realWriter
+
+	if respErr != nil {
+		return usage, respErr
+	}
+
+	captured := cw.body.Bytes()
+
 	if isStream {
-		return responsesStreamHandler(c, resp, metaObj)
+		return responsesConvertStreamFromOpenAI(c, captured, usage)
 	}
-	return responsesNonStreamHandler(c, resp, metaObj)
+	return responsesConvertNonStreamFromOpenAI(c, captured, usage)
 }
 
-func responsesStreamHandler(c *gin.Context, resp *http.Response, metaObj *meta.Meta) (*model.Usage, *model.ErrorWithStatusCode) {
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Split(bufio.ScanLines)
-
-	responseId := generateResponseId()
-	var usage *model.Usage
-	var outputText strings.Builder
-	var assistantItemId string
-	var toolCallIds = make(map[int]string)
-
-	common.SetEventStreamHeaders(c)
-
-	// Send response.created event
-	sendResponsesEvent(c, "response.created", map[string]interface{}{
-		"type": "response.created",
-		"response": map[string]interface{}{
-			"id":     responseId,
-			"object": "response",
-			"status": "in_progress",
-		},
-	})
-
-	// Create assistant message item
-	assistantItemId = fmt.Sprintf("msg_%s", uuid.New().String()[:24])
-
-	for scanner.Scan() {
-		data := scanner.Text()
-		if !strings.HasPrefix(data, "data: ") {
-			continue
-		}
-
-		dataContent := strings.TrimPrefix(data, "data: ")
-		if dataContent == "[DONE]" {
-			// Send output_item.done for assistant message
-			sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
-				"type": "response.output_item.done",
-				"item": map[string]interface{}{
-					"type":    "message",
-					"id":      assistantItemId,
-					"role":    "assistant",
-					"status":  "completed",
-					"content": []interface{}{
-						map[string]interface{}{
-							"type": "output_text",
-							"text": outputText.String(),
-						},
-					},
-				},
-			})
-
-			// Send response.completed event
-			sendResponsesEvent(c, "response.completed", map[string]interface{}{
-				"type": "response.completed",
-				"response": map[string]interface{}{
-					"id":       responseId,
-					"object":   "response",
-					"status":   "completed",
-					"output":   []interface{}{},
-					"usage":    usage,
-				},
-			})
-			render.Done(c)
-			break
-		}
-
-		var streamResp ChatCompletionsStreamResponse
-		if err := json.Unmarshal([]byte(dataContent), &streamResp); err != nil {
-			logger.SysError("error unmarshalling stream response: " + err.Error())
-			continue
-		}
-
-		// Handle usage
-		if streamResp.Usage != nil {
-			usage = streamResp.Usage
-		}
-
-		// Handle choices
-		for _, choice := range streamResp.Choices {
-			// Handle content delta
-			if choice.Delta.Content != nil {
-				if text, ok := choice.Delta.Content.(string); ok && text != "" {
-					outputText.WriteString(text)
-
-					sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
-						"type":  "response.output_text.delta",
-						"delta": map[string]string{"text": text},
-						"item_id": assistantItemId,
-						"output_index": 0,
-					})
-				}
-			}
-
-			// Handle tool calls
-			for i, tc := range choice.Delta.ToolCalls {
-				if tc.Id != "" {
-					// New tool call
-					toolCallIds[i] = tc.Id
-					sendResponsesEvent(c, "response.output_item.added", map[string]interface{}{
-						"type": "response.output_item.added",
-						"item": map[string]interface{}{
-							"type":    "function_call",
-							"id":      fmt.Sprintf("fc_%s", tc.Id),
-							"call_id": tc.Id,
-							"name":    tc.Function.Name,
-							"status":  "in_progress",
-						},
-					})
-				}
-				if tc.Function.Arguments != nil {
-					var argsStr string
-					switch v := tc.Function.Arguments.(type) {
-					case string:
-						argsStr = v
-					default:
-						argsBytes, _ := json.Marshal(v)
-						argsStr = string(argsBytes)
-					}
-					sendResponsesEvent(c, "response.function_call_arguments.delta", map[string]interface{}{
-						"type": "response.function_call_arguments.delta",
-						"item_id": fmt.Sprintf("fc_%s", toolCallIds[i]),
-						"delta": map[string]string{
-							"arguments": argsStr,
-						},
-					})
-				}
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		logger.SysError("error reading stream: " + err.Error())
-	}
-
-	resp.Body.Close()
-	return usage, nil
-}
-
-func responsesNonStreamHandler(c *gin.Context, resp *http.Response, metaObj *meta.Meta) (*model.Usage, *model.ErrorWithStatusCode) {
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, openai.ErrorWrapper(err, "read_response_failed", http.StatusInternalServerError)
-	}
-	resp.Body.Close()
-
+// responsesConvertNonStreamFromOpenAI converts captured OpenAI chat completion JSON to Responses format
+func responsesConvertNonStreamFromOpenAI(c *gin.Context, data []byte, adaptorUsage *model.Usage) (*model.Usage, *model.ErrorWithStatusCode) {
 	var chatResp SlimTextResponse
-	if err := json.Unmarshal(body, &chatResp); err != nil {
+	if err := json.Unmarshal(data, &chatResp); err != nil {
 		return nil, openai.ErrorWrapper(err, "unmarshal_response_failed", http.StatusInternalServerError)
 	}
 
 	if chatResp.Error.Type != "" {
 		return nil, &model.ErrorWithStatusCode{
 			Error:      chatResp.Error,
-			StatusCode: resp.StatusCode,
+			StatusCode: http.StatusBadRequest,
 		}
 	}
 
-	// Convert to Responses API format
 	responseId := generateResponseId()
 	outputItems := make([]interface{}, 0)
 
 	for i, choice := range chatResp.Choices {
-		// Create message item
 		messageItem := map[string]interface{}{
 			"type":    "message",
 			"id":      fmt.Sprintf("msg_%d", i),
@@ -312,16 +219,8 @@ func responsesNonStreamHandler(c *gin.Context, resp *http.Response, metaObj *met
 			"content": []interface{}{},
 		}
 
-		// Add text content
 		if choice.Message.Content != nil {
-			var textContent string
-			switch v := choice.Message.Content.(type) {
-			case string:
-				textContent = v
-			default:
-				// For non-string content (e.g., array of content objects), skip or extract text
-				textContent = choice.Message.StringContent()
-			}
+			textContent := choice.Message.StringContent()
 			if textContent != "" {
 				messageItem["content"] = []interface{}{
 					map[string]interface{}{
@@ -332,7 +231,6 @@ func responsesNonStreamHandler(c *gin.Context, resp *http.Response, metaObj *met
 			}
 		}
 
-		// Add tool call items first
 		for _, tc := range choice.Message.ToolCalls {
 			var argsStr string
 			switch v := tc.Function.Arguments.(type) {
@@ -356,6 +254,11 @@ func responsesNonStreamHandler(c *gin.Context, resp *http.Response, metaObj *met
 		outputItems = append(outputItems, messageItem)
 	}
 
+	finalUsage := &chatResp.Usage
+	if adaptorUsage != nil {
+		finalUsage = adaptorUsage
+	}
+
 	responsesResp := map[string]interface{}{
 		"id":      responseId,
 		"object":  "response",
@@ -363,11 +266,273 @@ func responsesNonStreamHandler(c *gin.Context, resp *http.Response, metaObj *met
 		"model":   chatResp.Model,
 		"status":  "completed",
 		"output":  outputItems,
-		"usage":   chatResp.Usage,
+		"usage":   convertUsageToResponsesFormat(finalUsage),
 	}
 
 	c.JSON(http.StatusOK, responsesResp)
-	return &chatResp.Usage, nil
+	return finalUsage, nil
+}
+
+// responsesConvertStreamFromOpenAI converts captured OpenAI SSE stream data to Responses SSE format
+func responsesConvertStreamFromOpenAI(c *gin.Context, data []byte, adaptorUsage *model.Usage) (*model.Usage, *model.ErrorWithStatusCode) {
+	responseId := generateResponseId()
+	var usage *model.Usage
+	var outputText strings.Builder
+	assistantItemId := fmt.Sprintf("msg_%s", uuid.New().String()[:24])
+	toolCallIds := make(map[int]string)
+
+	common.SetEventStreamHeaders(c)
+
+	// Send response.created event
+	sendResponsesEvent(c, "response.created", map[string]interface{}{
+		"type": "response.created",
+		"response": map[string]interface{}{
+			"id":     responseId,
+			"object": "response",
+			"status": "in_progress",
+		},
+	})
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		dataContent := strings.TrimPrefix(line, "data: ")
+		if dataContent == "[DONE]" {
+			break
+		}
+
+		var streamResp ChatCompletionsStreamResponse
+		if err := json.Unmarshal([]byte(dataContent), &streamResp); err != nil {
+			continue
+		}
+
+		if streamResp.Usage != nil {
+			usage = streamResp.Usage
+		}
+
+		for _, choice := range streamResp.Choices {
+			if contentStr, ok := choice.Delta.Content.(string); ok && contentStr != "" {
+				outputText.WriteString(contentStr)
+				sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
+					"type":         "response.output_text.delta",
+					"delta":        map[string]string{"text": contentStr},
+					"item_id":      assistantItemId,
+					"output_index": 0,
+				})
+			}
+
+			for i, tc := range choice.Delta.ToolCalls {
+				if tc.Id != "" {
+					toolCallIds[i] = tc.Id
+					sendResponsesEvent(c, "response.output_item.added", map[string]interface{}{
+						"type": "response.output_item.added",
+						"item": map[string]interface{}{
+							"type":    "function_call",
+							"id":      fmt.Sprintf("fc_%s", tc.Id),
+							"call_id": tc.Id,
+							"name":    tc.Function.Name,
+							"status":  "in_progress",
+						},
+					})
+				}
+				if tc.Function.Arguments != nil {
+					var argsStr string
+					switch v := tc.Function.Arguments.(type) {
+					case string:
+						argsStr = v
+					default:
+						argsBytes, _ := json.Marshal(v)
+						argsStr = string(argsBytes)
+					}
+					if argsStr != "" {
+						sendResponsesEvent(c, "response.function_call_arguments.delta", map[string]interface{}{
+							"type":    "response.function_call_arguments.delta",
+							"item_id": fmt.Sprintf("fc_%s", toolCallIds[i]),
+							"delta": map[string]string{
+								"arguments": argsStr,
+							},
+						})
+					}
+				}
+			}
+		}
+	}
+
+	if adaptorUsage != nil {
+		usage = adaptorUsage
+	}
+
+	// Send output_item.done
+	sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
+		"type": "response.output_item.done",
+		"item": map[string]interface{}{
+			"type":   "message",
+			"id":     assistantItemId,
+			"role":   "assistant",
+			"status": "completed",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "output_text",
+					"text": outputText.String(),
+				},
+			},
+		},
+	})
+
+	// Send response.completed
+	sendResponsesEvent(c, "response.completed", map[string]interface{}{
+		"type": "response.completed",
+		"response": map[string]interface{}{
+			"id":     responseId,
+			"object": "response",
+			"status": "completed",
+			"output": []interface{}{},
+			"usage":  convertUsageToResponsesFormat(usage),
+		},
+	})
+	render.Done(c)
+
+	return usage, nil
+}
+
+// responsesStreamHandler handles stream responses from OpenAI-format upstream directly
+func responsesStreamHandler(c *gin.Context, resp *http.Response) (*model.Usage, *model.ErrorWithStatusCode) {
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Split(bufio.ScanLines)
+
+	responseId := generateResponseId()
+	var usage *model.Usage
+	var outputText strings.Builder
+	assistantItemId := fmt.Sprintf("msg_%s", uuid.New().String()[:24])
+	toolCallIds := make(map[int]string)
+
+	common.SetEventStreamHeaders(c)
+
+	// Send response.created event
+	sendResponsesEvent(c, "response.created", map[string]interface{}{
+		"type": "response.created",
+		"response": map[string]interface{}{
+			"id":     responseId,
+			"object": "response",
+			"status": "in_progress",
+		},
+	})
+
+	for scanner.Scan() {
+		data := scanner.Text()
+		if !strings.HasPrefix(data, "data: ") {
+			continue
+		}
+
+		dataContent := strings.TrimPrefix(data, "data: ")
+		if dataContent == "[DONE]" {
+			sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
+				"type": "response.output_item.done",
+				"item": map[string]interface{}{
+					"type":   "message",
+					"id":     assistantItemId,
+					"role":   "assistant",
+					"status": "completed",
+					"content": []interface{}{
+						map[string]interface{}{
+							"type": "output_text",
+							"text": outputText.String(),
+						},
+					},
+				},
+			})
+
+			sendResponsesEvent(c, "response.completed", map[string]interface{}{
+				"type": "response.completed",
+				"response": map[string]interface{}{
+					"id":     responseId,
+					"object": "response",
+					"status": "completed",
+					"output": []interface{}{},
+					"usage":  convertUsageToResponsesFormat(usage),
+				},
+			})
+			render.Done(c)
+			break
+		}
+
+		var streamResp ChatCompletionsStreamResponse
+		if err := json.Unmarshal([]byte(dataContent), &streamResp); err != nil {
+			logger.SysError("error unmarshalling stream response: " + err.Error())
+			continue
+		}
+
+		if streamResp.Usage != nil {
+			usage = streamResp.Usage
+		}
+
+		for _, choice := range streamResp.Choices {
+			if contentStr, ok := choice.Delta.Content.(string); ok && contentStr != "" {
+				outputText.WriteString(contentStr)
+				sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
+					"type":         "response.output_text.delta",
+					"delta":        map[string]string{"text": contentStr},
+					"item_id":      assistantItemId,
+					"output_index": 0,
+				})
+			}
+
+			for i, tc := range choice.Delta.ToolCalls {
+				if tc.Id != "" {
+					toolCallIds[i] = tc.Id
+					sendResponsesEvent(c, "response.output_item.added", map[string]interface{}{
+						"type": "response.output_item.added",
+						"item": map[string]interface{}{
+							"type":    "function_call",
+							"id":      fmt.Sprintf("fc_%s", tc.Id),
+							"call_id": tc.Id,
+							"name":    tc.Function.Name,
+							"status":  "in_progress",
+						},
+					})
+				}
+				if tc.Function.Arguments != nil {
+					var argsStr string
+					switch v := tc.Function.Arguments.(type) {
+					case string:
+						argsStr = v
+					default:
+						argsBytes, _ := json.Marshal(v)
+						argsStr = string(argsBytes)
+					}
+					if argsStr != "" {
+						sendResponsesEvent(c, "response.function_call_arguments.delta", map[string]interface{}{
+							"type":    "response.function_call_arguments.delta",
+							"item_id": fmt.Sprintf("fc_%s", toolCallIds[i]),
+							"delta": map[string]string{
+								"arguments": argsStr,
+							},
+						})
+					}
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.SysError("error reading stream: " + err.Error())
+	}
+	resp.Body.Close()
+	return usage, nil
+}
+
+// responsesNonStreamHandler handles non-stream responses from OpenAI-format upstream directly
+func responsesNonStreamHandler(c *gin.Context, resp *http.Response) (*model.Usage, *model.ErrorWithStatusCode) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, openai.ErrorWrapper(err, "read_response_failed", http.StatusInternalServerError)
+	}
+	resp.Body.Close()
+
+	return responsesConvertNonStreamFromOpenAI(c, body, nil)
 }
 
 // Helper functions
@@ -454,6 +619,22 @@ func convertResponsesToChatCompletions(req *model.ResponsesRequest) *model.Gener
 	return chatReq
 }
 
+// convertUsageToResponsesFormat converts Usage to Responses API format with input_tokens/output_tokens
+func convertUsageToResponsesFormat(usage *model.Usage) map[string]interface{} {
+	if usage == nil {
+		return map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": 0,
+			"total_tokens":  0,
+		}
+	}
+	return map[string]interface{}{
+		"input_tokens":  usage.PromptTokens,
+		"output_tokens": usage.CompletionTokens,
+		"total_tokens":  usage.TotalTokens,
+	}
+}
+
 func generateResponseId() string {
 	return fmt.Sprintf("resp_%s", uuid.New().String()[:24])
 }
@@ -469,14 +650,14 @@ func sendResponsesEvent(c *gin.Context, eventType string, data interface{}) {
 
 // SlimTextResponse for parsing non-stream responses
 type SlimTextResponse struct {
-	Id      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int64    `json:"created"`
-	Model   string   `json:"model"`
+	Id      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
 	Choices []struct {
-		Index        int          `json:"index"`
+		Index        int           `json:"index"`
 		Message      model.Message `json:"message"`
-		FinishReason string       `json:"finish_reason"`
+		FinishReason string        `json:"finish_reason"`
 	} `json:"choices"`
 	Usage model.Usage `json:"usage"`
 	Error model.Error `json:"error"`
@@ -489,9 +670,9 @@ type ChatCompletionsStreamResponse struct {
 	Created int64  `json:"created"`
 	Model   string `json:"model"`
 	Choices []struct {
-		Index        int          `json:"index"`
+		Index        int           `json:"index"`
 		Delta        model.Message `json:"delta"`
-		FinishReason *string      `json:"finish_reason"`
+		FinishReason *string       `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *model.Usage `json:"usage,omitempty"`
 }
