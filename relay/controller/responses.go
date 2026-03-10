@@ -3,7 +3,6 @@ package controller
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -222,16 +221,17 @@ func responsesStreamHandler(c *gin.Context, resp *http.Response, metaObj *meta.M
 		// Handle choices
 		for _, choice := range streamResp.Choices {
 			// Handle content delta
-			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
-				text := *choice.Delta.Content
-				outputText.WriteString(text)
+			if choice.Delta.Content != nil {
+				if text, ok := choice.Delta.Content.(string); ok && text != "" {
+					outputText.WriteString(text)
 
-				sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
-					"type":  "response.output_text.delta",
-					"delta": map[string]string{"text": text},
-					"item_id": assistantItemId,
-					"output_index": 0,
-				})
+					sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
+						"type":  "response.output_text.delta",
+						"delta": map[string]string{"text": text},
+						"item_id": assistantItemId,
+						"output_index": 0,
+					})
+				}
 			}
 
 			// Handle tool calls
@@ -250,12 +250,20 @@ func responsesStreamHandler(c *gin.Context, resp *http.Response, metaObj *meta.M
 						},
 					})
 				}
-				if tc.Function.Arguments != "" {
+				if tc.Function.Arguments != nil {
+					var argsStr string
+					switch v := tc.Function.Arguments.(type) {
+					case string:
+						argsStr = v
+					default:
+						argsBytes, _ := json.Marshal(v)
+						argsStr = string(argsBytes)
+					}
 					sendResponsesEvent(c, "response.function_call_arguments.delta", map[string]interface{}{
 						"type": "response.function_call_arguments.delta",
 						"item_id": fmt.Sprintf("fc_%s", toolCallIds[i]),
 						"delta": map[string]string{
-							"arguments": tc.Function.Arguments,
+							"arguments": argsStr,
 						},
 					})
 				}
@@ -306,22 +314,40 @@ func responsesNonStreamHandler(c *gin.Context, resp *http.Response, metaObj *met
 
 		// Add text content
 		if choice.Message.Content != nil {
-			messageItem["content"] = []interface{}{
-				map[string]interface{}{
-					"type": "output_text",
-					"text": choice.Message.Content,
-				},
+			var textContent string
+			switch v := choice.Message.Content.(type) {
+			case string:
+				textContent = v
+			default:
+				// For non-string content (e.g., array of content objects), skip or extract text
+				textContent = choice.Message.StringContent()
+			}
+			if textContent != "" {
+				messageItem["content"] = []interface{}{
+					map[string]interface{}{
+						"type": "output_text",
+						"text": textContent,
+					},
+				}
 			}
 		}
 
 		// Add tool call items first
 		for _, tc := range choice.Message.ToolCalls {
+			var argsStr string
+			switch v := tc.Function.Arguments.(type) {
+			case string:
+				argsStr = v
+			default:
+				argsBytes, _ := json.Marshal(v)
+				argsStr = string(argsBytes)
+			}
 			toolItem := map[string]interface{}{
 				"type":      "function_call",
 				"id":        fmt.Sprintf("fc_%s", tc.Id),
 				"call_id":   tc.Id,
 				"name":      tc.Function.Name,
-				"arguments": tc.Function.Arguments,
+				"arguments": argsStr,
 				"status":    "completed",
 			}
 			outputItems = append(outputItems, toolItem)
