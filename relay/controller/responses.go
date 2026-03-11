@@ -64,6 +64,9 @@ func ResponsesHelper(c *gin.Context, relayMode int) *model.ErrorWithStatusCode {
 		return bizErr
 	}
 
+	// Override request URL path to chat/completions since we converted the request
+	metaObj.RequestURLPath = "/v1/chat/completions"
+
 	// Get adaptor
 	adaptorObj := relay.GetAdaptor(metaObj.APIType)
 	if adaptorObj == nil {

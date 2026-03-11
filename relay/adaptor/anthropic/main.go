@@ -101,6 +101,23 @@ func ConvertRequest(textRequest model.GeneralOpenAIRequest) *Request {
 		claudeMessage := Message{
 			Role: message.Role,
 		}
+		// Handle assistant messages with tool_calls but no text content
+		if message.Role == "assistant" && len(message.ToolCalls) > 0 && !message.IsStringContent() && message.Content == nil {
+			for i := range message.ToolCalls {
+				inputParam := make(map[string]any)
+				if argStr, ok := message.ToolCalls[i].Function.Arguments.(string); ok {
+					_ = json.Unmarshal([]byte(argStr), &inputParam)
+				}
+				claudeMessage.Content = append(claudeMessage.Content, Content{
+					Type:  "tool_use",
+					Id:    message.ToolCalls[i].Id,
+					Name:  message.ToolCalls[i].Function.Name,
+					Input: inputParam,
+				})
+			}
+			claudeRequest.Messages = append(claudeRequest.Messages, claudeMessage)
+			continue
+		}
 		var content Content
 		if message.IsStringContent() {
 			content.Type = "text"
