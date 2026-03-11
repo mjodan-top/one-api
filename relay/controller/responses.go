@@ -282,7 +282,16 @@ func responsesConvertStreamFromOpenAI(c *gin.Context, data []byte, adaptorUsage 
 	var usage *model.Usage
 	var outputText strings.Builder
 	assistantItemId := fmt.Sprintf("msg_%s", uuid.New().String()[:24])
-	toolCallIds := make(map[int]string)
+	messageItemAdded := false
+	// Track tool calls: index -> {id, name, arguments}
+	type toolCallState struct {
+		Id        string
+		Name      string
+		Arguments strings.Builder
+	}
+	toolCalls := make(map[int]*toolCallState)
+	toolCallOrder := make([]int, 0)
+	outputIndex := 0
 
 	common.SetEventStreamHeaders(c)
 
@@ -317,29 +326,26 @@ func responsesConvertStreamFromOpenAI(c *gin.Context, data []byte, adaptorUsage 
 		}
 
 		for _, choice := range streamResp.Choices {
-			if contentStr, ok := choice.Delta.Content.(string); ok && contentStr != "" {
-				outputText.WriteString(contentStr)
-				sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
-					"type":         "response.output_text.delta",
-					"delta":        map[string]string{"text": contentStr},
-					"item_id":      assistantItemId,
-					"output_index": 0,
-				})
-			}
-
+			// Handle tool calls
 			for i, tc := range choice.Delta.ToolCalls {
 				if tc.Id != "" {
-					toolCallIds[i] = tc.Id
+					// New tool call started
+					tcs := &toolCallState{Id: tc.Id, Name: tc.Function.Name}
+					toolCalls[i] = tcs
+					toolCallOrder = append(toolCallOrder, i)
 					sendResponsesEvent(c, "response.output_item.added", map[string]interface{}{
-						"type": "response.output_item.added",
+						"type":         "response.output_item.added",
+						"output_index": outputIndex,
 						"item": map[string]interface{}{
-							"type":    "function_call",
-							"id":      fmt.Sprintf("fc_%s", tc.Id),
-							"call_id": tc.Id,
-							"name":    tc.Function.Name,
-							"status":  "in_progress",
+							"type":      "function_call",
+							"id":        fmt.Sprintf("fc_%s", tc.Id),
+							"call_id":   tc.Id,
+							"name":      tc.Function.Name,
+							"arguments": "",
+							"status":    "in_progress",
 						},
 					})
+					outputIndex++
 				}
 				if tc.Function.Arguments != nil {
 					var argsStr string
@@ -350,16 +356,52 @@ func responsesConvertStreamFromOpenAI(c *gin.Context, data []byte, adaptorUsage 
 						argsBytes, _ := json.Marshal(v)
 						argsStr = string(argsBytes)
 					}
-					if argsStr != "" {
+					if argsStr != "" && toolCalls[i] != nil {
+						toolCalls[i].Arguments.WriteString(argsStr)
 						sendResponsesEvent(c, "response.function_call_arguments.delta", map[string]interface{}{
-							"type":    "response.function_call_arguments.delta",
-							"item_id": fmt.Sprintf("fc_%s", toolCallIds[i]),
-							"delta": map[string]string{
-								"arguments": argsStr,
-							},
+							"type":         "response.function_call_arguments.delta",
+							"item_id":      fmt.Sprintf("fc_%s", toolCalls[i].Id),
+							"output_index": i,
+							"delta":        argsStr,
 						})
 					}
 				}
+			}
+
+			// Handle text content
+			if contentStr, ok := choice.Delta.Content.(string); ok && contentStr != "" {
+				if !messageItemAdded {
+					messageItemAdded = true
+					sendResponsesEvent(c, "response.output_item.added", map[string]interface{}{
+						"type":         "response.output_item.added",
+						"output_index": outputIndex,
+						"item": map[string]interface{}{
+							"type":    "message",
+							"id":      assistantItemId,
+							"role":    "assistant",
+							"status":  "in_progress",
+							"content": []interface{}{},
+						},
+					})
+					sendResponsesEvent(c, "response.content_part.added", map[string]interface{}{
+						"type":          "response.content_part.added",
+						"item_id":       assistantItemId,
+						"output_index":  outputIndex,
+						"content_index": 0,
+						"part": map[string]interface{}{
+							"type": "output_text",
+							"text": "",
+						},
+					})
+				}
+				outputText.WriteString(contentStr)
+				sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
+					"type":          "response.output_text.delta",
+					"item_id":       assistantItemId,
+					"output_index":  outputIndex,
+					"content_index": 0,
+					"delta":         contentStr,
+				})
 			}
 		}
 	}
@@ -368,31 +410,91 @@ func responsesConvertStreamFromOpenAI(c *gin.Context, data []byte, adaptorUsage 
 		usage = adaptorUsage
 	}
 
-	// Send output_item.done
-	sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
-		"type": "response.output_item.done",
-		"item": map[string]interface{}{
-			"type":   "message",
-			"id":     assistantItemId,
-			"role":   "assistant",
-			"status": "completed",
-			"content": []interface{}{
-				map[string]interface{}{
-					"type": "output_text",
-					"text": outputText.String(),
-				},
-			},
-		},
-	})
+	// Finalize: send done events for all tool calls
+	outputItems := make([]interface{}, 0)
+	for _, idx := range toolCallOrder {
+		tcs := toolCalls[idx]
+		if tcs == nil {
+			continue
+		}
+		args := tcs.Arguments.String()
+		if args == "" {
+			args = "{}"
+		}
+		// Send function_call_arguments.done
+		sendResponsesEvent(c, "response.function_call_arguments.done", map[string]interface{}{
+			"type":         "response.function_call_arguments.done",
+			"item_id":      fmt.Sprintf("fc_%s", tcs.Id),
+			"output_index": idx,
+			"arguments":    args,
+		})
+		// Send output_item.done for this function_call
+		fcItem := map[string]interface{}{
+			"type":      "function_call",
+			"id":        fmt.Sprintf("fc_%s", tcs.Id),
+			"call_id":   tcs.Id,
+			"name":      tcs.Name,
+			"arguments": args,
+			"status":    "completed",
+		}
+		sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
+			"type":         "response.output_item.done",
+			"output_index": idx,
+			"item":         fcItem,
+		})
+		outputItems = append(outputItems, fcItem)
+	}
 
-	// Send response.completed
+	// Finalize: send done events for message item
+	if messageItemAdded || outputText.Len() > 0 {
+		msgContent := []interface{}{
+			map[string]interface{}{
+				"type": "output_text",
+				"text": outputText.String(),
+			},
+		}
+		// Send output_text.done
+		sendResponsesEvent(c, "response.output_text.done", map[string]interface{}{
+			"type":          "response.output_text.done",
+			"item_id":       assistantItemId,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"text":          outputText.String(),
+		})
+		// Send content_part.done
+		sendResponsesEvent(c, "response.content_part.done", map[string]interface{}{
+			"type":          "response.content_part.done",
+			"item_id":       assistantItemId,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"part": map[string]interface{}{
+				"type": "output_text",
+				"text": outputText.String(),
+			},
+		})
+		msgItem := map[string]interface{}{
+			"type":    "message",
+			"id":      assistantItemId,
+			"role":    "assistant",
+			"status":  "completed",
+			"content": msgContent,
+		}
+		sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
+			"type":         "response.output_item.done",
+			"output_index": outputIndex,
+			"item":         msgItem,
+		})
+		outputItems = append(outputItems, msgItem)
+	}
+
+	// Send response.completed with full output
 	sendResponsesEvent(c, "response.completed", map[string]interface{}{
 		"type": "response.completed",
 		"response": map[string]interface{}{
 			"id":     responseId,
 			"object": "response",
 			"status": "completed",
-			"output": []interface{}{},
+			"output": outputItems,
 			"usage":  convertUsageToResponsesFormat(usage),
 		},
 	})
@@ -410,7 +512,16 @@ func responsesStreamHandler(c *gin.Context, resp *http.Response) (*model.Usage, 
 	var usage *model.Usage
 	var outputText strings.Builder
 	assistantItemId := fmt.Sprintf("msg_%s", uuid.New().String()[:24])
-	toolCallIds := make(map[int]string)
+	messageItemAdded := false
+	// Track tool calls: index -> {id, name, arguments}
+	type toolCallState struct {
+		Id        string
+		Name      string
+		Arguments strings.Builder
+	}
+	toolCalls := make(map[int]*toolCallState)
+	toolCallOrder := make([]int, 0) // track order of tool calls
+	outputIndex := 0                // next output_index to assign
 
 	common.SetEventStreamHeaders(c)
 
@@ -432,33 +543,6 @@ func responsesStreamHandler(c *gin.Context, resp *http.Response) (*model.Usage, 
 
 		dataContent := strings.TrimPrefix(data, "data: ")
 		if dataContent == "[DONE]" {
-			sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
-				"type": "response.output_item.done",
-				"item": map[string]interface{}{
-					"type":   "message",
-					"id":     assistantItemId,
-					"role":   "assistant",
-					"status": "completed",
-					"content": []interface{}{
-						map[string]interface{}{
-							"type": "output_text",
-							"text": outputText.String(),
-						},
-					},
-				},
-			})
-
-			sendResponsesEvent(c, "response.completed", map[string]interface{}{
-				"type": "response.completed",
-				"response": map[string]interface{}{
-					"id":     responseId,
-					"object": "response",
-					"status": "completed",
-					"output": []interface{}{},
-					"usage":  convertUsageToResponsesFormat(usage),
-				},
-			})
-			render.Done(c)
 			break
 		}
 
@@ -473,29 +557,26 @@ func responsesStreamHandler(c *gin.Context, resp *http.Response) (*model.Usage, 
 		}
 
 		for _, choice := range streamResp.Choices {
-			if contentStr, ok := choice.Delta.Content.(string); ok && contentStr != "" {
-				outputText.WriteString(contentStr)
-				sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
-					"type":         "response.output_text.delta",
-					"delta":        map[string]string{"text": contentStr},
-					"item_id":      assistantItemId,
-					"output_index": 0,
-				})
-			}
-
+			// Handle tool calls
 			for i, tc := range choice.Delta.ToolCalls {
 				if tc.Id != "" {
-					toolCallIds[i] = tc.Id
+					// New tool call started
+					tcs := &toolCallState{Id: tc.Id, Name: tc.Function.Name}
+					toolCalls[i] = tcs
+					toolCallOrder = append(toolCallOrder, i)
 					sendResponsesEvent(c, "response.output_item.added", map[string]interface{}{
-						"type": "response.output_item.added",
+						"type":         "response.output_item.added",
+						"output_index": outputIndex,
 						"item": map[string]interface{}{
-							"type":    "function_call",
-							"id":      fmt.Sprintf("fc_%s", tc.Id),
-							"call_id": tc.Id,
-							"name":    tc.Function.Name,
-							"status":  "in_progress",
+							"type":      "function_call",
+							"id":        fmt.Sprintf("fc_%s", tc.Id),
+							"call_id":   tc.Id,
+							"name":      tc.Function.Name,
+							"arguments": "",
+							"status":    "in_progress",
 						},
 					})
+					outputIndex++
 				}
 				if tc.Function.Arguments != nil {
 					var argsStr string
@@ -506,19 +587,145 @@ func responsesStreamHandler(c *gin.Context, resp *http.Response) (*model.Usage, 
 						argsBytes, _ := json.Marshal(v)
 						argsStr = string(argsBytes)
 					}
-					if argsStr != "" {
+					if argsStr != "" && toolCalls[i] != nil {
+						toolCalls[i].Arguments.WriteString(argsStr)
 						sendResponsesEvent(c, "response.function_call_arguments.delta", map[string]interface{}{
-							"type":    "response.function_call_arguments.delta",
-							"item_id": fmt.Sprintf("fc_%s", toolCallIds[i]),
-							"delta": map[string]string{
-								"arguments": argsStr,
-							},
+							"type":         "response.function_call_arguments.delta",
+							"item_id":      fmt.Sprintf("fc_%s", toolCalls[i].Id),
+							"output_index": i,
+							"delta":        argsStr,
 						})
 					}
 				}
 			}
+
+			// Handle text content
+			if contentStr, ok := choice.Delta.Content.(string); ok && contentStr != "" {
+				if !messageItemAdded {
+					messageItemAdded = true
+					sendResponsesEvent(c, "response.output_item.added", map[string]interface{}{
+						"type":         "response.output_item.added",
+						"output_index": outputIndex,
+						"item": map[string]interface{}{
+							"type":   "message",
+							"id":     assistantItemId,
+							"role":   "assistant",
+							"status": "in_progress",
+							"content": []interface{}{},
+						},
+					})
+					sendResponsesEvent(c, "response.content_part.added", map[string]interface{}{
+						"type":         "response.content_part.added",
+						"item_id":      assistantItemId,
+						"output_index": outputIndex,
+						"content_index": 0,
+						"part": map[string]interface{}{
+							"type": "output_text",
+							"text": "",
+						},
+					})
+				}
+				outputText.WriteString(contentStr)
+				sendResponsesEvent(c, "response.output_text.delta", map[string]interface{}{
+					"type":          "response.output_text.delta",
+					"item_id":       assistantItemId,
+					"output_index":  outputIndex,
+					"content_index": 0,
+					"delta":         contentStr,
+				})
+			}
 		}
 	}
+
+	// Finalize: send done events for all tool calls
+	outputItems := make([]interface{}, 0)
+	for _, idx := range toolCallOrder {
+		tcs := toolCalls[idx]
+		if tcs == nil {
+			continue
+		}
+		args := tcs.Arguments.String()
+		if args == "" {
+			args = "{}"
+		}
+		// Send function_call_arguments.done
+		sendResponsesEvent(c, "response.function_call_arguments.done", map[string]interface{}{
+			"type":         "response.function_call_arguments.done",
+			"item_id":      fmt.Sprintf("fc_%s", tcs.Id),
+			"output_index": idx,
+			"arguments":    args,
+		})
+		// Send output_item.done for this function_call
+		fcItem := map[string]interface{}{
+			"type":      "function_call",
+			"id":        fmt.Sprintf("fc_%s", tcs.Id),
+			"call_id":   tcs.Id,
+			"name":      tcs.Name,
+			"arguments": args,
+			"status":    "completed",
+		}
+		sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
+			"type":         "response.output_item.done",
+			"output_index": idx,
+			"item":         fcItem,
+		})
+		outputItems = append(outputItems, fcItem)
+	}
+
+	// Finalize: send done events for message item
+	if messageItemAdded || outputText.Len() > 0 {
+		msgContent := []interface{}{
+			map[string]interface{}{
+				"type": "output_text",
+				"text": outputText.String(),
+			},
+		}
+		// Send output_text.done
+		sendResponsesEvent(c, "response.output_text.done", map[string]interface{}{
+			"type":          "response.output_text.done",
+			"item_id":       assistantItemId,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"text":          outputText.String(),
+		})
+		// Send content_part.done
+		sendResponsesEvent(c, "response.content_part.done", map[string]interface{}{
+			"type":          "response.content_part.done",
+			"item_id":       assistantItemId,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"part": map[string]interface{}{
+				"type": "output_text",
+				"text": outputText.String(),
+			},
+		})
+		msgItem := map[string]interface{}{
+			"type":    "message",
+			"id":      assistantItemId,
+			"role":    "assistant",
+			"status":  "completed",
+			"content": msgContent,
+		}
+		sendResponsesEvent(c, "response.output_item.done", map[string]interface{}{
+			"type":         "response.output_item.done",
+			"output_index": outputIndex,
+			"item":         msgItem,
+		})
+		outputItems = append(outputItems, msgItem)
+	}
+
+	// Send response.completed with full output
+	sendResponsesEvent(c, "response.completed", map[string]interface{}{
+		"type": "response.completed",
+		"response": map[string]interface{}{
+			"id":     responseId,
+			"object": "response",
+			"status": "completed",
+			"output": outputItems,
+			"usage":  convertUsageToResponsesFormat(usage),
+		},
+	})
+	render.Done(c)
 
 	if err := scanner.Err(); err != nil {
 		logger.SysError("error reading stream: " + err.Error())
