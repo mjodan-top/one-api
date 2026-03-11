@@ -7,11 +7,39 @@ type ResponsesRequest struct {
 	Model        string              `json:"model"`
 	Input        ResponsesInput      `json:"input"`
 	Instructions *string             `json:"instructions,omitempty"`
-	Tools        []Tool              `json:"tools,omitempty"`
+	Tools        []ResponsesTool     `json:"tools,omitempty"`
 	Stream       bool                `json:"stream,omitempty"`
 	Temperature  *float64            `json:"temperature,omitempty"`
 	TopP         *float64            `json:"top_p,omitempty"`
 	MaxTokens    *int                `json:"max_output_tokens,omitempty"`
+}
+
+// ResponsesTool represents a tool in Responses API format (flat structure)
+// e.g. {"type": "function", "name": "shell", "description": "...", "parameters": {...}}
+type ResponsesTool struct {
+	Type        string `json:"type"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+// ToTools converts Responses API tools to Chat Completions tools format
+func ResponsesToolsToTools(rTools []ResponsesTool) []Tool {
+	var tools []Tool
+	for _, rt := range rTools {
+		if rt.Type == "function" {
+			tools = append(tools, Tool{
+				Type: "function",
+				Function: Function{
+					Name:        rt.Name,
+					Description: rt.Description,
+					Parameters:  rt.Parameters,
+				},
+			})
+		}
+		// Skip non-function tools (web_search, custom, etc.) as they are not supported in Chat Completions
+	}
+	return tools
 }
 
 // ResponsesInput can be a string or an array of ResponsesInputItem

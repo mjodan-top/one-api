@@ -545,7 +545,7 @@ func convertResponsesToChatCompletions(req *model.ResponsesRequest) *model.Gener
 		Stream:      req.Stream,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
-		Tools:       req.Tools,
+		Tools:       model.ResponsesToolsToTools(req.Tools),
 	}
 
 	if req.MaxTokens != nil {
